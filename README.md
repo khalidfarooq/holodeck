@@ -38,38 +38,38 @@ When you prompt **Claude Code, Google Antigravity, or Cursor** to build a featur
 
 ```mermaid
 flowchart LR
-    subgraph Agent["🤖 Autonomous AI Agent (Claude Code / Antigravity / Cursor)"]
+    subgraph Agent["Autonomous AI Agent (Claude Code / Antigravity / Cursor)"]
         LLM["Agent Reasoning Engine"]
     end
 
-    subgraph Holodeck["🌌 Holodeck Runtime (127.0.0.1:8787)"]
+    subgraph Holodeck["Holodeck Local Cloud Runtime (127.0.0.1:8787)"]
         direction TB
-        MCP["MCP JSON-RPC Server (stdio)"]
+        MCP["MCP JSON-RPC Server"]
         ROUTER["Axum Local Cloud Router"]
 
-        subgraph Providers["Stateful Cloud Services"]
-            STRIPE["💳 Stripe Simulator<br/>(Customers, Checkouts, Invoices)"]
-            OAUTH["🔑 OAuth2 / OIDC Provider<br/>(Google, GitHub Redirects & Tokens)"]
-            S3["🪣 S3 Storage<br/>(Presigned URLs, Buckets, Payloads)"]
-            NOTIF["📨 Notification Sandbox<br/>(Resend, SendGrid, Twilio)"]
+        subgraph Providers["Stateful Cloud Simulators"]
+            STRIPE["Stripe Simulator<br/>Checkouts, Customers, Webhooks"]
+            OAUTH["OAuth2 / OIDC Provider<br/>Tokens, Redirects, Userinfo"]
+            S3["S3 Blob Storage<br/>Buckets, Presigned URLs"]
+            NOTIF["Notification Sandbox<br/>Resend, SendGrid, Twilio"]
         end
 
         subgraph EventBus["Verification Engine"]
-            HMAC["🔐 HMAC-SHA256 Cryptographic Signer"]
-            LOG["📜 Queryable Event Log"]
+            HMAC["HMAC-SHA256 Webhook Signer"]
+            LOG["In-Memory Queryable Event Log"]
         end
     end
 
-    subgraph App["💻 Your Local App Under Test (localhost:3000)"]
-        BACKEND["Local Server Endpoints & Webhook Handlers"]
+    subgraph App["Local App Under Test (localhost:3000)"]
+        BACKEND["Local Server & Webhook Endpoints"]
     end
 
-    LLM <-->|MCP Tools (stdio)| MCP
+    LLM <-->|MCP Tools Stdio| MCP
     MCP <--> ROUTER
     ROUTER --> Providers
     Providers --> LOG
-    HMAC -->|HMAC Signed Webhook POST| BACKEND
-    BACKEND -->|Mock Cloud API Calls (.env.test)| ROUTER
+    HMAC -->|HMAC Signed Webhooks| BACKEND
+    BACKEND -->|Mock Cloud API Calls| ROUTER
 ```
 
 ---
