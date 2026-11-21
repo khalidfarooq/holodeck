@@ -1,0 +1,149 @@
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use holodeck_core::dispatcher::{WebhookDeliveryResult, WebhookDispatcher};
+use holodeck_core::events::{EventBus, MockEvent};
+use holodeck_notif::NotificationSimulator;
+use holodeck_oauth::OAuthSimulator;
+use holodeck_storage::StorageSimulator;
+use holodeck_stripe::StripeSimulator;
+use serde::Deserialize;
+use std::net::SocketAddr;
+use tower_http::cors::{Any, CorsLayer};
+use tracing::info;
+
+#[derive(Clone)]
+pub struct HolodeckApp {
+    pub event_bus: EventBus,
+    pub dispatcher: WebhookDispatcher,
+    pub base_url: String,
+}
+
+impl HolodeckApp {
+    pub fn new(port: u16) -> Self {
+        let base_url = format!("http://127.0.0.1:{}", port);
+        let event_bus = EventBus::new();
+        let dispatcher = WebhookDispatcher::new(event_bus.clone());
+
+        Self {
+            event_bus,
+            dispatcher,
+            base_url,
+        }
+    }
+
+    pub fn build_router(&self) -> Router {
+        let stripe = StripeSimulator::new(self.event_bus.clone(), self.base_url.clone());
+        let oauth = OAuthSimulator::new(self.event_bus.clone());
+        let storage = StorageSimulator::new(self.event_bus.clone(), self.base_url.clone());
+        let notif = NotificationSimulator::new(self.event_bus.clone());
+
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+
+        Router::new()
+            .route("/health", get(health_check))
+            .route("/events", get(list_events).delete(clear_events))
+            .route("/webhook/trigger", post(trigger_webhook))
+            .with_state(self.clone())
+            .merge(stripe.router())
+            .merge(oauth.router())
+            .merge(storage.router())
+            .merge(notif.router())
+            .layer(cors)
+    }
+
+    pub async fn run(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+        let app = self.build_router();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        info!("🌌 Holodeck Mock Cloud Server listening on http://{}", addr);
+
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+}
+
+async fn health_check() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "healthy",
+        "service": "holodeck",
+        "version": "0.1.0"
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct EventQueryParams {
+    pub provider: Option<String>,
+    pub limit: Option<usize>,
+}
+
+async fn list_events(
+    State(app): State<HolodeckApp>,
+    Query(params): Query<EventQueryParams>,
+) -> Json<Vec<MockEvent>> {
+    let limit = params.limit.unwrap_or(50);
+    let events = app.event_bus.list(params.provider.as_deref(), limit).await;
+    Json(events)
+}
+
+async fn clear_events(
+    State(app): State<HolodeckApp>,
+    Query(params): Query<EventQueryParams>,
+) -> impl IntoResponse {
+    app.event_bus.clear(params.provider.as_deref()).await;
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+pub struct TriggerWebhookPayload {
+    pub provider: String,
+    pub target_url: String,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub secret: Option<String>,
+}
+
+async fn trigger_webhook(
+    State(app): State<HolodeckApp>,
+    Json(body): Json<TriggerWebhookPayload>,
+) -> Result<Json<WebhookDeliveryResult>, (StatusCode, String)> {
+    let secret = body
+        .secret
+        .unwrap_or_else(|| "whsec_test_holodeck_secret_key".to_string());
+
+    match app
+        .dispatcher
+        .dispatch(
+            &body.provider,
+            &body.target_url,
+            &body.event_type,
+            &body.payload,
+            &secret,
+        )
+        .await
+    {
+        Ok(result) => Ok(Json(result)),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_holodeck_app_builder() {
+        let app = HolodeckApp::new(8787);
+        let _router = app.build_router();
+
+        let events = app.event_bus.list(None, 10).await;
+        assert_eq!(events.len(), 0);
+    }
+}

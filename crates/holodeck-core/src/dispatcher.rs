@@ -11,6 +11,7 @@ pub struct WebhookDeliveryResult {
     pub error: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct WebhookDispatcher {
     client: reqwest::Client,
     event_bus: EventBus,
