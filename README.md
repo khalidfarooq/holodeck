@@ -16,6 +16,10 @@
 [![Rust 1.83+](https://img.shields.io/badge/rust-1.83%2B-orange.svg)](#)
 [![100% Local First](https://img.shields.io/badge/privacy-100%25%20Local%20First-success.svg)](#)
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Holodeck Autonomous AI Agent Terminal Demo" width="100%" style="border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);" />
+</p>
+
 ---
 
 ## ⚡ The Problem: Why Autonomous Coding Agents Get Stuck
