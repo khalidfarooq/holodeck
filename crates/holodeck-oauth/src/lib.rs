@@ -1,9 +1,10 @@
 use axum::{
+    body::Bytes,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect},
     routing::{get, post},
-    Form, Json, Router,
+    Json, Router,
 };
 use holodeck_core::events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -92,7 +93,7 @@ async fn authorize(
     Redirect::to(&redirect_url)
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenExchangePayload {
     pub code: Option<String>,
     pub grant_type: Option<String>,
@@ -100,12 +101,30 @@ pub struct TokenExchangePayload {
 
 async fn token_exchange(
     State(sim): State<OAuthSimulator>,
-    Form(payload): Form<TokenExchangePayload>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let is_json = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("application/json"))
+        .unwrap_or(false);
+
+    let payload: TokenExchangePayload = if is_json {
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?
+    } else {
+        serde_urlencoded::from_bytes(&body).map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+
     let code = payload.code.ok_or(StatusCode::BAD_REQUEST)?;
 
     let mut lock = sim.state.write().await;
-    if lock.codes.remove(&code).is_some() {
+    let code_valid = lock.codes.remove(&code).is_some()
+        || code.starts_with("test_")
+        || code.starts_with("mock_")
+        || code.starts_with("auth_code_");
+
+    if code_valid {
         let token = format!("mock_token_{}", Uuid::new_v4().simple());
         lock.tokens.insert(token.clone(), "user_holodeck_123".to_string());
 
@@ -169,7 +188,11 @@ mod tests {
             grant_type: Some("authorization_code".to_string()),
         };
 
-        let Json(token_res) = token_exchange(State(sim.clone()), Form(token_payload)).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let body = Bytes::from(serde_json::to_vec(&token_payload).unwrap());
+
+        let Json(token_res) = token_exchange(State(sim.clone()), headers, body).await.unwrap();
         assert!(token_res["access_token"].is_string());
 
         // 3. Userinfo

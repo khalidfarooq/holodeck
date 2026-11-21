@@ -536,14 +536,17 @@ dependencies = [
 name = "holodeck-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "holodeck-core",
  "holodeck-mcp",
  "holodeck-server",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -597,10 +600,12 @@ name = "holodeck-oauth"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "chrono",
  "holodeck-core",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "tokio",
  "tracing",
  "uuid",
@@ -612,10 +617,12 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "holodeck-core",
+ "holodeck-mcp",
  "holodeck-notif",
  "holodeck-oauth",
  "holodeck-storage",
  "holodeck-stripe",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

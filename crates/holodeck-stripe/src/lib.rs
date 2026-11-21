@@ -42,6 +42,7 @@ pub struct StripeCheckoutSession {
     pub amount_total: Option<i64>,
     pub currency: Option<String>,
     pub status: String,
+    pub payment_status: String,
     pub url: String,
     pub success_url: Option<String>,
     pub cancel_url: Option<String>,
@@ -210,6 +211,7 @@ async fn create_checkout_session(
         amount_total: Some(4900),
         currency: Some("usd".to_string()),
         status: "open".to_string(),
+        payment_status: "unpaid".to_string(),
         url: checkout_url,
         success_url: payload.success_url,
         cancel_url: payload.cancel_url,
@@ -237,6 +239,7 @@ async fn complete_checkout_session(
     let mut lock = sim.state.write().await;
     if let Some(session) = lock.checkout_sessions.get_mut(&id) {
         session.status = "complete".to_string();
+        session.payment_status = "paid".to_string();
         let cloned = session.clone();
 
         sim.event_bus
