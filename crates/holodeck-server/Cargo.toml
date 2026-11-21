@@ -1,0 +1,19 @@
+[package]
+name = "holodeck-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+holodeck-core.workspace = true
+holodeck-stripe.workspace = true
+holodeck-oauth.workspace = true
+holodeck-storage.workspace = true
+holodeck-notif.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
