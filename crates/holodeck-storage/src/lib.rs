@@ -33,6 +33,11 @@ impl StorageSimulator {
         }
     }
 
+    pub async fn reset(&self) {
+        let mut lock = self.state.write().await;
+        lock.objects.clear();
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route("/storage/presign", post(generate_presigned_url))

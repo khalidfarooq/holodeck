@@ -51,6 +51,22 @@ impl NotificationSimulator {
         }
     }
 
+    pub async fn reset(&self) {
+        let mut lock = self.state.write().await;
+        lock.emails.clear();
+        lock.sms.clear();
+    }
+
+    pub async fn clear_emails(&self) {
+        let mut lock = self.state.write().await;
+        lock.emails.clear();
+    }
+
+    pub async fn clear_sms(&self) {
+        let mut lock = self.state.write().await;
+        lock.sms.clear();
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route("/emails", post(resend_send_email))
@@ -122,23 +138,84 @@ async fn sendgrid_send_mail(
     State(sim): State<NotificationSimulator>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let to_vec: Vec<String> = payload
+        .get("personalizations")
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|p0| p0.get("to"))
+        .and_then(|t| t.as_array())
+        .map(|recipients| {
+            recipients
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("email")
+                        .and_then(|e| e.as_str())
+                        .or_else(|| entry.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    if to_vec.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "errors": [{
+                    "message": "The personalizations[0].to array is required and must contain at least one recipient email.",
+                    "field": "personalizations.0.to"
+                }]
+            })),
+        )
+            .into_response();
+    }
+
+    let subject = payload
+        .get("subject")
+        .and_then(|s| s.as_str())
+        .or_else(|| {
+            payload
+                .get("personalizations")
+                .and_then(|p| p.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|p0| p0.get("subject"))
+                .and_then(|s| s.as_str())
+        })
+        .unwrap_or("No Subject")
+        .to_string();
+
+    let body = payload
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c0| c0.get("value"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| payload.to_string());
+
     let email = CapturedEmail {
         id: format!("sg_{}", Uuid::new_v4().simple()),
-        from: payload["from"]["email"].as_str().unwrap_or("sendgrid@mock.com").to_string(),
-        to: vec!["recipient@mock.com".to_string()],
-        subject: payload["subject"].as_str().unwrap_or("No Subject").to_string(),
-        body: payload.to_string(),
+        from: payload["from"]["email"]
+            .as_str()
+            .unwrap_or("sendgrid@mock.com")
+            .to_string(),
+        to: to_vec,
+        subject,
+        body,
         timestamp: Utc::now().timestamp(),
     };
 
     let mut lock = sim.state.write().await;
     lock.emails.push(email.clone());
+    drop(lock);
 
     sim.event_bus
         .emit("email", "email.sent", serde_json::to_value(&email).unwrap())
         .await;
 
-    StatusCode::ACCEPTED
+    StatusCode::ACCEPTED.into_response()
 }
 
 // Twilio SMS
@@ -234,8 +311,49 @@ mod tests {
         assert_eq!(sms_list.len(), 1);
         assert_eq!(sms_list[0].body, "Verification code: 9999");
 
-        // 4. Verify EventBus
+        // 4. SendGrid Email with personalizations[0].to
+        let sg_payload = serde_json::json!({
+            "personalizations": [{
+                "to": [
+                    {"email": "alice@sendgrid.test", "name": "Alice"},
+                    {"email": "bob@sendgrid.test"}
+                ]
+            }],
+            "from": {"email": "noreply@sendgrid.test"},
+            "subject": "Welcome via SendGrid",
+            "content": [{"type": "text/plain", "value": "Hello from SendGrid"}]
+        });
+        let sg_res = sendgrid_send_mail(State(sim.clone()), Json(sg_payload))
+            .await
+            .into_response();
+        assert_eq!(sg_res.status(), StatusCode::ACCEPTED);
+
+        let emails_after_sg = list_emails(State(sim.clone())).await;
+        assert_eq!(emails_after_sg.len(), 2);
+        assert_eq!(
+            emails_after_sg[1].to,
+            vec!["alice@sendgrid.test".to_string(), "bob@sendgrid.test".to_string()]
+        );
+        assert_eq!(emails_after_sg[1].from, "noreply@sendgrid.test");
+        assert_eq!(emails_after_sg[1].subject, "Welcome via SendGrid");
+        assert_eq!(emails_after_sg[1].body, "Hello from SendGrid");
+
+        // Missing personalizations[0].to -> 400
+        let bad_sg = sendgrid_send_mail(
+            State(sim.clone()),
+            Json(serde_json::json!({"from": {"email": "noreply@sendgrid.test"}})),
+        )
+        .await
+        .into_response();
+        assert_eq!(bad_sg.status(), StatusCode::BAD_REQUEST);
+
+        // 5. Verify EventBus
         let all_events = bus.list(None, 10).await;
-        assert_eq!(all_events.len(), 2);
+        assert_eq!(all_events.len(), 3);
+
+        // 6. Reset clears emails & sms
+        sim.reset().await;
+        assert_eq!(list_emails(State(sim.clone())).await.len(), 0);
+        assert_eq!(list_sms(State(sim.clone())).await.len(), 0);
     }
 }

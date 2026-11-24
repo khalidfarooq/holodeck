@@ -67,6 +67,42 @@ pub struct StripeDbState {
     pub subscriptions: HashMap<String, StripeSubscription>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StripeErrorDetail {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StripeErrorResponse {
+    pub error: StripeErrorDetail,
+}
+
+fn stripe_error(
+    status: StatusCode,
+    error_type: &str,
+    code: Option<&str>,
+    param: Option<&str>,
+    message: impl Into<String>,
+) -> (StatusCode, Json<StripeErrorResponse>) {
+    (
+        status,
+        Json(StripeErrorResponse {
+            error: StripeErrorDetail {
+                error_type: error_type.to_string(),
+                code: code.map(|s| s.to_string()),
+                message: message.into(),
+                param: param.map(|s| s.to_string()),
+            },
+        }),
+    )
+}
+
 #[derive(Clone)]
 pub struct StripeSimulator {
     pub state: Arc<RwLock<StripeDbState>>,
@@ -81,6 +117,14 @@ impl StripeSimulator {
             event_bus,
             base_url,
         }
+    }
+
+    pub async fn reset(&self) {
+        let mut lock = self.state.write().await;
+        lock.customers.clear();
+        lock.payment_intents.clear();
+        lock.checkout_sessions.clear();
+        lock.subscriptions.clear();
     }
 
     pub fn router(self) -> Router {
@@ -141,9 +185,17 @@ async fn list_customers(State(sim): State<StripeSimulator>) -> impl IntoResponse
 async fn get_customer(
     State(sim): State<StripeSimulator>,
     Path(id): Path<String>,
-) -> Result<Json<StripeCustomer>, StatusCode> {
+) -> Result<Json<StripeCustomer>, (StatusCode, Json<StripeErrorResponse>)> {
     let lock = sim.state.read().await;
-    lock.customers.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
+    lock.customers.get(&id).cloned().map(Json).ok_or_else(|| {
+        stripe_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            Some("resource_missing"),
+            Some("id"),
+            format!("No such customer: '{}'", id),
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -156,7 +208,40 @@ pub struct CreatePaymentIntentPayload {
 async fn create_payment_intent(
     State(sim): State<StripeSimulator>,
     Json(payload): Json<CreatePaymentIntentPayload>,
-) -> (StatusCode, Json<StripePaymentIntent>) {
+) -> Result<(StatusCode, Json<StripePaymentIntent>), (StatusCode, Json<StripeErrorResponse>)> {
+    if payload.amount <= 0 {
+        return Err(stripe_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("parameter_invalid_integer"),
+            Some("amount"),
+            "Invalid positive integer: amount must be greater than 0",
+        ));
+    }
+
+    if payload.currency.trim().is_empty() {
+        return Err(stripe_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("parameter_missing"),
+            Some("currency"),
+            "Missing required param: currency",
+        ));
+    }
+
+    let mut lock = sim.state.write().await;
+    if let Some(ref cust_id) = payload.customer {
+        if !lock.customers.contains_key(cust_id) {
+            return Err(stripe_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("resource_missing"),
+                Some("customer"),
+                format!("No such customer: '{}'", cust_id),
+            ));
+        }
+    }
+
     let id = format!("pi_test_{}", Uuid::new_v4().simple());
     let secret = format!("{}_secret_{}", id, Uuid::new_v4().simple());
 
@@ -171,27 +256,41 @@ async fn create_payment_intent(
         created: Utc::now().timestamp(),
     };
 
-    let mut lock = sim.state.write().await;
     lock.payment_intents.insert(id.clone(), intent.clone());
+    drop(lock);
 
     sim.event_bus
         .emit("stripe", "payment_intent.succeeded", serde_json::to_value(&intent).unwrap())
         .await;
 
-    (StatusCode::OK, Json(intent))
+    Ok((StatusCode::OK, Json(intent)))
 }
 
 async fn get_payment_intent(
     State(sim): State<StripeSimulator>,
     Path(id): Path<String>,
-) -> Result<Json<StripePaymentIntent>, StatusCode> {
+) -> Result<Json<StripePaymentIntent>, (StatusCode, Json<StripeErrorResponse>)> {
     let lock = sim.state.read().await;
-    lock.payment_intents.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
+    lock.payment_intents
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| {
+            stripe_error(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                Some("resource_missing"),
+                Some("id"),
+                format!("No such payment_intent: '{}'", id),
+            )
+        })
 }
 
 #[derive(Deserialize)]
 pub struct CreateCheckoutSessionPayload {
     pub customer: Option<String>,
+    pub amount_total: Option<i64>,
+    pub currency: Option<String>,
     pub success_url: Option<String>,
     pub cancel_url: Option<String>,
     pub mode: Option<String>,
@@ -200,7 +299,44 @@ pub struct CreateCheckoutSessionPayload {
 async fn create_checkout_session(
     State(sim): State<StripeSimulator>,
     Json(payload): Json<CreateCheckoutSessionPayload>,
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<StripeCheckoutSession>), (StatusCode, Json<StripeErrorResponse>)> {
+    if let Some(amount) = payload.amount_total {
+        if amount <= 0 {
+            return Err(stripe_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("parameter_invalid_integer"),
+                Some("amount_total"),
+                "Invalid positive integer: amount_total must be greater than 0",
+            ));
+        }
+    }
+
+    if let Some(ref curr) = payload.currency {
+        if curr.trim().is_empty() {
+            return Err(stripe_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("parameter_invalid_empty"),
+                Some("currency"),
+                "Currency must not be empty",
+            ));
+        }
+    }
+
+    let mut lock = sim.state.write().await;
+    if let Some(ref cust_id) = payload.customer {
+        if !lock.customers.contains_key(cust_id) {
+            return Err(stripe_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("resource_missing"),
+                Some("customer"),
+                format!("No such customer: '{}'", cust_id),
+            ));
+        }
+    }
+
     let id = format!("cs_test_{}", Uuid::new_v4().simple());
     let checkout_url = format!("{}/simulate/checkout/{}", sim.base_url, id);
 
@@ -208,8 +344,8 @@ async fn create_checkout_session(
         id: id.clone(),
         object: "checkout.session".to_string(),
         customer: payload.customer,
-        amount_total: Some(4900),
-        currency: Some("usd".to_string()),
+        amount_total: Some(payload.amount_total.unwrap_or(4900)),
+        currency: Some(payload.currency.unwrap_or_else(|| "usd".to_string())),
         status: "open".to_string(),
         payment_status: "unpaid".to_string(),
         url: checkout_url,
@@ -218,29 +354,46 @@ async fn create_checkout_session(
         created: Utc::now().timestamp(),
     };
 
-    let mut lock = sim.state.write().await;
     lock.checkout_sessions.insert(id.clone(), session.clone());
+    drop(lock);
 
-    (StatusCode::OK, Json(session))
+    sim.event_bus
+        .emit("stripe", "checkout.session.created", serde_json::to_value(&session).unwrap())
+        .await;
+
+    Ok((StatusCode::OK, Json(session)))
 }
 
 async fn get_checkout_session(
     State(sim): State<StripeSimulator>,
     Path(id): Path<String>,
-) -> Result<Json<StripeCheckoutSession>, StatusCode> {
+) -> Result<Json<StripeCheckoutSession>, (StatusCode, Json<StripeErrorResponse>)> {
     let lock = sim.state.read().await;
-    lock.checkout_sessions.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
+    lock.checkout_sessions
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| {
+            stripe_error(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                Some("resource_missing"),
+                Some("id"),
+                format!("No such checkout.session: '{}'", id),
+            )
+        })
 }
 
 async fn complete_checkout_session(
     State(sim): State<StripeSimulator>,
     Path(id): Path<String>,
-) -> Result<Json<StripeCheckoutSession>, StatusCode> {
+) -> Result<Json<StripeCheckoutSession>, (StatusCode, Json<StripeErrorResponse>)> {
     let mut lock = sim.state.write().await;
     if let Some(session) = lock.checkout_sessions.get_mut(&id) {
         session.status = "complete".to_string();
         session.payment_status = "paid".to_string();
         let cloned = session.clone();
+        drop(lock);
 
         sim.event_bus
             .emit("stripe", "checkout.session.completed", serde_json::to_value(&cloned).unwrap())
@@ -248,7 +401,13 @@ async fn complete_checkout_session(
 
         Ok(Json(cloned))
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(stripe_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            Some("resource_missing"),
+            Some("id"),
+            format!("No such checkout.session: '{}'", id),
+        ))
     }
 }
 
@@ -260,7 +419,18 @@ pub struct CreateSubscriptionPayload {
 async fn create_subscription(
     State(sim): State<StripeSimulator>,
     Json(payload): Json<CreateSubscriptionPayload>,
-) -> (StatusCode, Json<StripeSubscription>) {
+) -> Result<(StatusCode, Json<StripeSubscription>), (StatusCode, Json<StripeErrorResponse>)> {
+    let mut lock = sim.state.write().await;
+    if !lock.customers.contains_key(&payload.customer) {
+        return Err(stripe_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("resource_missing"),
+            Some("customer"),
+            format!("No such customer: '{}'", payload.customer),
+        ));
+    }
+
     let id = format!("sub_test_{}", Uuid::new_v4().simple());
     let sub = StripeSubscription {
         id: id.clone(),
@@ -271,32 +441,45 @@ async fn create_subscription(
         created: Utc::now().timestamp(),
     };
 
-    let mut lock = sim.state.write().await;
     lock.subscriptions.insert(id.clone(), sub.clone());
+    drop(lock);
 
     sim.event_bus
         .emit("stripe", "customer.subscription.created", serde_json::to_value(&sub).unwrap())
         .await;
 
-    (StatusCode::OK, Json(sub))
+    Ok((StatusCode::OK, Json(sub)))
 }
 
 async fn get_subscription(
     State(sim): State<StripeSimulator>,
     Path(id): Path<String>,
-) -> Result<Json<StripeSubscription>, StatusCode> {
+) -> Result<Json<StripeSubscription>, (StatusCode, Json<StripeErrorResponse>)> {
     let lock = sim.state.read().await;
-    lock.subscriptions.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
+    lock.subscriptions
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| {
+            stripe_error(
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                Some("resource_missing"),
+                Some("id"),
+                format!("No such subscription: '{}'", id),
+            )
+        })
 }
 
 async fn cancel_subscription(
     State(sim): State<StripeSimulator>,
     Path(id): Path<String>,
-) -> Result<Json<StripeSubscription>, StatusCode> {
+) -> Result<Json<StripeSubscription>, (StatusCode, Json<StripeErrorResponse>)> {
     let mut lock = sim.state.write().await;
     if let Some(sub) = lock.subscriptions.get_mut(&id) {
         sub.status = "canceled".to_string();
         let cloned = sub.clone();
+        drop(lock);
 
         sim.event_bus
             .emit("stripe", "customer.subscription.deleted", serde_json::to_value(&cloned).unwrap())
@@ -304,7 +487,13 @@ async fn cancel_subscription(
 
         Ok(Json(cloned))
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(stripe_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            Some("resource_missing"),
+            Some("id"),
+            format!("No such subscription: '{}'", id),
+        ))
     }
 }
 
@@ -331,21 +520,105 @@ mod tests {
             currency: "usd".to_string(),
             customer: Some(cust.id.clone()),
         };
-        let (_, Json(pi)) = create_payment_intent(State(sim.clone()), Json(pi_payload)).await;
+        let (_, Json(pi)) = create_payment_intent(State(sim.clone()), Json(pi_payload))
+            .await
+            .unwrap();
         assert_eq!(pi.status, "succeeded");
 
-        // 3. Create Subscription & Cancel
+        // 3. Create Checkout Session with dynamic amount & currency, plus default fallback
+        let cs_dynamic = CreateCheckoutSessionPayload {
+            customer: Some(cust.id.clone()),
+            amount_total: Some(9900),
+            currency: Some("eur".to_string()),
+            success_url: None,
+            cancel_url: None,
+            mode: None,
+        };
+        let (_, Json(session_dyn)) = create_checkout_session(State(sim.clone()), Json(cs_dynamic))
+            .await
+            .unwrap();
+        assert_eq!(session_dyn.amount_total, Some(9900));
+        assert_eq!(session_dyn.currency.as_deref(), Some("eur"));
+
+        let cs_default = CreateCheckoutSessionPayload {
+            customer: None,
+            amount_total: None,
+            currency: None,
+            success_url: None,
+            cancel_url: None,
+            mode: None,
+        };
+        let (_, Json(session_def)) = create_checkout_session(State(sim.clone()), Json(cs_default))
+            .await
+            .unwrap();
+        assert_eq!(session_def.amount_total, Some(4900));
+        assert_eq!(session_def.currency.as_deref(), Some("usd"));
+
+        // 4. Create Subscription & Cancel
         let sub_payload = CreateSubscriptionPayload {
             customer: cust.id.clone(),
         };
-        let (_, Json(sub)) = create_subscription(State(sim.clone()), Json(sub_payload)).await;
+        let (_, Json(sub)) = create_subscription(State(sim.clone()), Json(sub_payload))
+            .await
+            .unwrap();
         assert_eq!(sub.status, "active");
 
         let Json(canceled) = cancel_subscription(State(sim.clone()), Path(sub.id)).await.unwrap();
         assert_eq!(canceled.status, "canceled");
 
-        // 4. Verify EventBus captured all 3 events
+        // 5. Verify EventBus captured all 6 events (including checkout.session.created x2)
         let events = bus.list(Some("stripe"), 10).await;
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 6);
+        assert!(events.iter().any(|e| e.event_type == "checkout.session.created"));
+
+        // 6. Reset clears all Stripe stores
+        sim.reset().await;
+        assert!(get_customer(State(sim.clone()), Path(cust.id)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stripe_validation_errors() {
+        let bus = EventBus::new();
+        let sim = StripeSimulator::new(bus, "http://localhost:8787".to_string());
+
+        // Non-positive PaymentIntent amount -> 400 Stripe error JSON
+        let bad_pi = CreatePaymentIntentPayload {
+            amount: 0,
+            currency: "usd".to_string(),
+            customer: None,
+        };
+        let (status, Json(err)) = create_payment_intent(State(sim.clone()), Json(bad_pi))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error.error_type, "invalid_request_error");
+        assert_eq!(err.error.param.as_deref(), Some("amount"));
+
+        // Negative amount
+        let neg_pi = CreatePaymentIntentPayload {
+            amount: -100,
+            currency: "usd".to_string(),
+            customer: None,
+        };
+        let (status, _) = create_payment_intent(State(sim.clone()), Json(neg_pi))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Missing customer on checkout session -> 400 resource_missing
+        let missing_cust_cs = CreateCheckoutSessionPayload {
+            customer: Some("cus_does_not_exist".to_string()),
+            amount_total: Some(1500),
+            currency: Some("usd".to_string()),
+            success_url: None,
+            cancel_url: None,
+            mode: None,
+        };
+        let (status, Json(err)) = create_checkout_session(State(sim.clone()), Json(missing_cust_cs))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error.code.as_deref(), Some("resource_missing"));
+        assert_eq!(err.error.param.as_deref(), Some("customer"));
     }
 }

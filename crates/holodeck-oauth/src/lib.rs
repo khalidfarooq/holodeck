@@ -42,6 +42,12 @@ impl OAuthSimulator {
         }
     }
 
+    pub async fn reset(&self) {
+        let mut lock = self.state.write().await;
+        lock.codes.clear();
+        lock.tokens.clear();
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route("/oauth/authorize", get(authorize))
@@ -103,7 +109,7 @@ async fn token_exchange(
     State(sim): State<OAuthSimulator>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let is_json = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -111,25 +117,52 @@ async fn token_exchange(
         .unwrap_or(false);
 
     let payload: TokenExchangePayload = if is_json {
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?
+        serde_json::from_slice(&body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_request",
+                    "error_description": "Malformed JSON request body"
+                })),
+            )
+        })?
     } else {
-        serde_urlencoded::from_bytes(&body).map_err(|_| StatusCode::BAD_REQUEST)?
+        serde_urlencoded::from_bytes(&body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_request",
+                    "error_description": "Malformed form-urlencoded request body"
+                })),
+            )
+        })?
     };
 
-    let code = payload.code.ok_or(StatusCode::BAD_REQUEST)?;
+    let code = payload.code.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_request",
+                "error_description": "Missing required parameter: code"
+            })),
+        )
+    })?;
 
     let mut lock = sim.state.write().await;
-    let code_valid = lock.codes.remove(&code).is_some()
-        || code.starts_with("test_")
-        || code.starts_with("mock_")
-        || code.starts_with("auth_code_");
+    let issued_code = lock.codes.remove(&code);
 
-    if code_valid {
+    if let Some(code_entry) = issued_code {
         let token = format!("mock_token_{}", Uuid::new_v4().simple());
-        lock.tokens.insert(token.clone(), "user_holodeck_123".to_string());
+        lock.tokens
+            .insert(token.clone(), "user_holodeck_123".to_string());
+        drop(lock);
 
         sim.event_bus
-            .emit("oauth", "oauth.token_exchanged", serde_json::json!({"token": token}))
+            .emit(
+                "oauth",
+                "oauth.token_exchanged",
+                serde_json::json!({"token": token}),
+            )
             .await;
 
         Ok(Json(serde_json::json!({
@@ -137,24 +170,69 @@ async fn token_exchange(
             "token_type": "Bearer",
             "expires_in": 3600,
             "id_token": "mock.jwt.id_token",
-            "scope": "openid profile email"
+            "scope": code_entry.scope
         })))
     } else {
-        Err(StatusCode::UNAUTHORIZED)
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Invalid or expired authorization code"
+            })),
+        ))
     }
 }
 
-async fn userinfo() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "sub": "user_holodeck_123",
-        "id": "user_holodeck_123",
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let header_val = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let mut parts = header_val.splitn(2, ' ');
+    let scheme = parts.next()?;
+    let token = parts.next()?.trim();
+    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+async fn userinfo(
+    State(sim): State<OAuthSimulator>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "invalid_token",
+                "error_description": "Missing or malformed Authorization Bearer token"
+            })),
+        )
+    })?;
+
+    let lock = sim.state.read().await;
+    let user_id = lock.tokens.get(token).cloned().ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "invalid_token",
+                "error_description": "Access token is invalid or expired"
+            })),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "sub": user_id,
+        "id": user_id,
         "email": "developer@holodeck.local",
         "email_verified": true,
         "name": "Holodeck Test Developer",
         "login": "holodeck-user",
         "avatar_url": "https://holodeck.local/avatar.png",
         "picture": "https://holodeck.local/avatar.png"
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -174,7 +252,9 @@ mod tests {
             state: Some("xyz123".to_string()),
         };
 
-        let response = authorize(State(sim.clone()), Query(auth_params)).await.into_response();
+        let response = authorize(State(sim.clone()), Query(auth_params))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
         let code = {
@@ -182,25 +262,72 @@ mod tests {
             lock.codes.keys().next().unwrap().clone()
         };
 
-        // 2. Token Exchange
-        let token_payload = TokenExchangePayload {
-            code: Some(code),
+        // 2. Unissued code must fail with 401
+        let unissued_payload = TokenExchangePayload {
+            code: Some("test_unissued_code".to_string()),
             grant_type: Some("authorization_code".to_string()),
         };
-
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
+        let bad_body = Bytes::from(serde_json::to_vec(&unissued_payload).unwrap());
+        let (err_status, _) = token_exchange(State(sim.clone()), headers.clone(), bad_body)
+            .await
+            .unwrap_err();
+        assert_eq!(err_status, StatusCode::UNAUTHORIZED);
+
+        // 3. Token Exchange with issued code succeeds once
+        let token_payload = TokenExchangePayload {
+            code: Some(code.clone()),
+            grant_type: Some("authorization_code".to_string()),
+        };
         let body = Bytes::from(serde_json::to_vec(&token_payload).unwrap());
 
-        let Json(token_res) = token_exchange(State(sim.clone()), headers, body).await.unwrap();
-        assert!(token_res["access_token"].is_string());
+        let Json(token_res) = token_exchange(State(sim.clone()), headers.clone(), body.clone())
+            .await
+            .unwrap();
+        let access_token = token_res["access_token"].as_str().unwrap().to_string();
+        assert_eq!(token_res["scope"], "openid email");
 
-        // 3. Userinfo
-        let Json(profile) = userinfo().await;
+        // Reusing same code must fail with 401
+        let (reuse_status, _) = token_exchange(State(sim.clone()), headers, body)
+            .await
+            .unwrap_err();
+        assert_eq!(reuse_status, StatusCode::UNAUTHORIZED);
+
+        // 4. Userinfo rejects missing or invalid token
+        let (no_auth_status, _) = userinfo(State(sim.clone()), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(no_auth_status, StatusCode::UNAUTHORIZED);
+
+        let mut bad_auth = HeaderMap::new();
+        bad_auth.insert("authorization", "Bearer invalid_tok".parse().unwrap());
+        let (bad_auth_status, _) = userinfo(State(sim.clone()), bad_auth)
+            .await
+            .unwrap_err();
+        assert_eq!(bad_auth_status, StatusCode::UNAUTHORIZED);
+
+        // 5. Userinfo succeeds with issued Bearer token
+        let mut auth_headers = HeaderMap::new();
+        auth_headers.insert(
+            "authorization",
+            format!("Bearer {}", access_token).parse().unwrap(),
+        );
+        let Json(profile) = userinfo(State(sim.clone()), auth_headers.clone())
+            .await
+            .unwrap();
         assert_eq!(profile["email"], "developer@holodeck.local");
+        assert_eq!(profile["sub"], "user_holodeck_123");
 
-        // 4. Verify Events
+        // 6. Verify Events
         let events = bus.list(Some("oauth"), 10).await;
         assert_eq!(events.len(), 2);
+
+        // 7. Reset invalidates tokens
+        sim.reset().await;
+        let (after_reset_status, _) = userinfo(State(sim.clone()), auth_headers)
+            .await
+            .unwrap_err();
+        assert_eq!(after_reset_status, StatusCode::UNAUTHORIZED);
     }
 }
