@@ -26,15 +26,72 @@ pub struct JsonRpcResponse {
 pub struct HolodeckMcpServer {
     pub event_bus: EventBus,
     pub dispatcher: WebhookDispatcher,
+    pub daemon_url: Option<String>,
+    pub http_client: reqwest::Client,
 }
 
 impl HolodeckMcpServer {
+    /// Creates a standalone in-memory MCP server backed by the provided EventBus.
     pub fn new(event_bus: EventBus) -> Self {
         let dispatcher = WebhookDispatcher::new(event_bus.clone());
         Self {
             event_bus,
             dispatcher,
+            daemon_url: None,
+            http_client: reqwest::Client::new(),
         }
+    }
+
+    /// Creates an MCP server connected to a running Holodeck HTTP daemon.
+    pub fn connect(base_url: impl Into<String>) -> Self {
+        Self::new(EventBus::new()).with_daemon_url(base_url)
+    }
+
+    /// Configures this MCP server to proxy state inspection, webhook dispatch, and reset calls
+    /// to a running Holodeck HTTP daemon at `base_url`.
+    pub fn with_daemon_url(mut self, base_url: impl Into<String>) -> Self {
+        let normalized = base_url.into().trim_end_matches('/').to_string();
+        self.daemon_url = Some(normalized);
+        self
+    }
+
+    async fn parse_daemon_response(
+        &self,
+        resp: reqwest::Response,
+        endpoint: &str,
+    ) -> Result<serde_json::Value, String> {
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| {
+            format!(
+                "Failed reading response from Holodeck daemon {}: {}",
+                endpoint, e
+            )
+        })?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "Holodeck daemon {} returned HTTP {}: {}",
+                endpoint, status, body
+            ));
+        }
+
+        if body.trim().is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+
+        serde_json::from_str(&body).map_err(|e| {
+            format!(
+                "Invalid JSON response from Holodeck daemon {}: {}",
+                endpoint, e
+            )
+        })
+    }
+
+    fn unreachable_error(&self, base_url: &str, err: reqwest::Error) -> String {
+        format!(
+            "Unable to reach Holodeck daemon at {} ({}). Start it with `holodeck start` or run MCP with `--standalone`.",
+            base_url, err
+        )
     }
 
     /// Handles tool invocations from AI coding agents (Claude Code, Antigravity, Cursor)
@@ -76,29 +133,80 @@ impl HolodeckMcpServer {
 
                 let payload = args.get("payload").unwrap_or(&default_payload);
 
-                let result = self
-                    .dispatcher
-                    .dispatch(provider, target_url, event_type, payload, secret)
-                    .await?;
+                if let Some(ref base_url) = self.daemon_url {
+                    let endpoint = format!("{}/webhook/trigger", base_url);
+                    let resp = self
+                        .http_client
+                        .post(&endpoint)
+                        .json(&serde_json::json!({
+                            "provider": provider,
+                            "target_url": target_url,
+                            "event_type": event_type,
+                            "payload": payload,
+                            "secret": secret,
+                        }))
+                        .send()
+                        .await
+                        .map_err(|e| self.unreachable_error(base_url, e))?;
 
-                Ok(serde_json::to_value(result).map_err(|e| e.to_string())?)
+                    self.parse_daemon_response(resp, &endpoint).await
+                } else {
+                    let result = self
+                        .dispatcher
+                        .dispatch(provider, target_url, event_type, payload, secret)
+                        .await?;
+
+                    serde_json::to_value(result).map_err(|e| e.to_string())
+                }
             }
             "holodeck_inspect_events" => {
                 let provider = args.get("provider").and_then(|v| v.as_str());
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-                let events = self.event_bus.list(provider, limit).await;
-                Ok(serde_json::to_value(events).map_err(|e| e.to_string())?)
+                if let Some(ref base_url) = self.daemon_url {
+                    let endpoint = format!("{}/events", base_url);
+                    let mut req = self
+                        .http_client
+                        .get(&endpoint)
+                        .query(&[("limit", limit.to_string())]);
+                    if let Some(p) = provider {
+                        req = req.query(&[("provider", p)]);
+                    }
+
+                    let resp = req
+                        .send()
+                        .await
+                        .map_err(|e| self.unreachable_error(base_url, e))?;
+
+                    self.parse_daemon_response(resp, &endpoint).await
+                } else {
+                    let events = self.event_bus.list(provider, limit).await;
+                    serde_json::to_value(events).map_err(|e| e.to_string())
+                }
             }
             "holodeck_get_mock_credentials" => {
                 let provider = args.get("provider").and_then(|v| v.as_str()).unwrap_or("stripe");
                 let creds = get_mock_credentials(provider);
-                Ok(serde_json::to_value(creds).map_err(|e| e.to_string())?)
+                serde_json::to_value(creds).map_err(|e| e.to_string())
             }
             "holodeck_reset_state" => {
                 let provider = args.get("provider").and_then(|v| v.as_str());
-                self.event_bus.clear(provider).await;
-                Ok(serde_json::json!({"status": "cleared"}))
+
+                if let Some(ref base_url) = self.daemon_url {
+                    let endpoint = format!("{}/reset", base_url);
+                    let resp = self
+                        .http_client
+                        .post(&endpoint)
+                        .json(&serde_json::json!({ "provider": provider }))
+                        .send()
+                        .await
+                        .map_err(|e| self.unreachable_error(base_url, e))?;
+
+                    self.parse_daemon_response(resp, &endpoint).await
+                } else {
+                    self.event_bus.clear(provider).await;
+                    Ok(serde_json::json!({"status": "cleared"}))
+                }
             }
             _ => Err(format!("Unknown tool: {}", name)),
         }
@@ -336,5 +444,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reset_res["status"], "cleared");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_daemon_unreachable_returns_clear_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url = format!("http://127.0.0.1:{}/", port);
+        let server = HolodeckMcpServer::connect(url);
+        assert_eq!(
+            server.daemon_url.as_deref(),
+            Some(format!("http://127.0.0.1:{}", port).as_str())
+        );
+
+        let inspect_err = server
+            .handle_tool_call("holodeck_inspect_events", serde_json::json!({"limit": 10}))
+            .await
+            .unwrap_err();
+        assert!(inspect_err.contains("Unable to reach Holodeck daemon"));
+        assert!(inspect_err.contains("holodeck start"));
+
+        let reset_err = server
+            .handle_tool_call("holodeck_reset_state", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(reset_err.contains("Unable to reach Holodeck daemon"));
+
+        let trigger_err = server
+            .handle_tool_call(
+                "holodeck_trigger_webhook",
+                serde_json::json!({"target_url": "http://127.0.0.1:9999/webhook"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(trigger_err.contains("Unable to reach Holodeck daemon"));
     }
 }

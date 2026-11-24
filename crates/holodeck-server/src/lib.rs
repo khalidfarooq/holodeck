@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
@@ -21,6 +22,10 @@ pub struct HolodeckApp {
     pub event_bus: EventBus,
     pub dispatcher: WebhookDispatcher,
     pub base_url: String,
+    pub stripe: StripeSimulator,
+    pub oauth: OAuthSimulator,
+    pub storage: StorageSimulator,
+    pub notif: NotificationSimulator,
 }
 
 impl HolodeckApp {
@@ -28,20 +33,23 @@ impl HolodeckApp {
         let base_url = format!("http://127.0.0.1:{}", port);
         let event_bus = EventBus::new();
         let dispatcher = WebhookDispatcher::new(event_bus.clone());
+        let stripe = StripeSimulator::new(event_bus.clone(), base_url.clone());
+        let oauth = OAuthSimulator::new(event_bus.clone());
+        let storage = StorageSimulator::new(event_bus.clone(), base_url.clone());
+        let notif = NotificationSimulator::new(event_bus.clone());
 
         Self {
             event_bus,
             dispatcher,
             base_url,
+            stripe,
+            oauth,
+            storage,
+            notif,
         }
     }
 
     pub fn build_router(&self) -> Router {
-        let stripe = StripeSimulator::new(self.event_bus.clone(), self.base_url.clone());
-        let oauth = OAuthSimulator::new(self.event_bus.clone());
-        let storage = StorageSimulator::new(self.event_bus.clone(), self.base_url.clone());
-        let notif = NotificationSimulator::new(self.event_bus.clone());
-
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -50,12 +58,13 @@ impl HolodeckApp {
         Router::new()
             .route("/health", get(health_check))
             .route("/events", get(list_events).delete(clear_events))
+            .route("/reset", post(reset_state))
             .route("/webhook/trigger", post(trigger_webhook))
             .with_state(self.clone())
-            .merge(stripe.router())
-            .merge(oauth.router())
-            .merge(storage.router())
-            .merge(notif.router())
+            .merge(self.stripe.clone().router())
+            .merge(self.oauth.clone().router())
+            .merge(self.storage.clone().router())
+            .merge(self.notif.clone().router())
             .layer(cors)
     }
 
@@ -99,6 +108,70 @@ async fn clear_events(
 ) -> impl IntoResponse {
     app.event_bus.clear(params.provider.as_deref()).await;
     StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize, Default)]
+pub struct ResetParams {
+    pub provider: Option<String>,
+}
+
+async fn reset_state(
+    State(app): State<HolodeckApp>,
+    Query(query): Query<ResetParams>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let body_provider = if body.is_empty() {
+        None
+    } else {
+        let parsed: ResetParams = serde_json::from_slice(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON body: {}", e)))?;
+        parsed.provider
+    };
+
+    let provider = query.provider.or(body_provider);
+
+    match provider.as_deref().map(|p| p.to_lowercase()).as_deref() {
+        Some("stripe") => {
+            app.stripe.reset().await;
+            app.event_bus.clear(Some("stripe")).await;
+        }
+        Some("oauth" | "google" | "github") => {
+            app.oauth.reset().await;
+            app.event_bus.clear(Some("oauth")).await;
+        }
+        Some("storage" | "s3" | "aws") => {
+            app.storage.reset().await;
+            app.event_bus.clear(Some("storage")).await;
+        }
+        Some("email" | "resend" | "sendgrid") => {
+            app.notif.clear_emails().await;
+            app.event_bus.clear(Some("email")).await;
+        }
+        Some("sms" | "twilio") => {
+            app.notif.clear_sms().await;
+            app.event_bus.clear(Some("sms")).await;
+        }
+        Some("notif" | "notifications") => {
+            app.notif.reset().await;
+            app.event_bus.clear(Some("email")).await;
+            app.event_bus.clear(Some("sms")).await;
+        }
+        Some(other) => {
+            app.event_bus.clear(Some(other)).await;
+        }
+        None => {
+            app.stripe.reset().await;
+            app.oauth.reset().await;
+            app.storage.reset().await;
+            app.notif.reset().await;
+            app.event_bus.clear(None).await;
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "cleared",
+        "provider": provider
+    })))
 }
 
 #[derive(Deserialize)]

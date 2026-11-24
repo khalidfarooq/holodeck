@@ -34,7 +34,19 @@ enum Commands {
     },
 
     /// Start the Model Context Protocol (MCP) stdio server for AI agents
-    Mcp,
+    Mcp {
+        /// Base URL of a running Holodeck HTTP daemon (defaults to HOLODECK_URL or http://127.0.0.1:8787)
+        #[arg(long, conflicts_with = "port")]
+        url: Option<String>,
+
+        /// Port of a running Holodeck HTTP daemon on 127.0.0.1
+        #[arg(short, long, conflicts_with = "url")]
+        port: Option<u16>,
+
+        /// Run in standalone in-memory mode without connecting to an HTTP daemon
+        #[arg(long, conflicts_with_all = ["url", "port"])]
+        standalone: bool,
+    },
 
     /// Dispatch a signed webhook payload to an endpoint
     Trigger {
@@ -97,7 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.run(port).await?;
         }
 
-        Commands::Mcp => {
+        Commands::Mcp {
+            url,
+            port,
+            standalone,
+        } => {
             // MCP must output ONLY JSON-RPC over stdout, so logs go to stderr
             tracing_subscriber::registry()
                 .with(
@@ -107,8 +123,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
                 .init();
 
-            let bus = EventBus::new();
-            let server = Arc::new(HolodeckMcpServer::new(bus));
+            let env_url = std::env::var("HOLODECK_URL").ok();
+            let server = match resolve_mcp_daemon_url(url, port, standalone, env_url) {
+                Some(base_url) => {
+                    tracing::info!("Connecting Holodeck MCP server to daemon at {}", base_url);
+                    Arc::new(HolodeckMcpServer::connect(base_url))
+                }
+                None => {
+                    tracing::info!("Starting Holodeck MCP server in standalone in-memory mode");
+                    Arc::new(HolodeckMcpServer::new(EventBus::new()))
+                }
+            };
             server.run_stdio().await?;
         }
 
@@ -209,6 +234,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn resolve_mcp_daemon_url(
+    url: Option<String>,
+    port: Option<u16>,
+    standalone: bool,
+    env_url: Option<String>,
+) -> Option<String> {
+    if standalone {
+        return None;
+    }
+    if let Some(u) = url {
+        return Some(u);
+    }
+    if let Some(p) = port {
+        return Some(format!("http://127.0.0.1:{}", p));
+    }
+    if let Some(u) = env_url.filter(|v| !v.trim().is_empty()) {
+        return Some(u);
+    }
+    Some("http://127.0.0.1:8787".to_string())
+}
+
 fn print_banner(port: u16) {
     println!(
         r#"
@@ -233,10 +279,49 @@ Available Mock Cloud Services:
                          http://127.0.0.1:{port}/v3/mail/send (SendGrid)
                          http://127.0.0.1:{port}/2010-04-01/Accounts/:sid/Messages.json (Twilio)
   🔍 Event Inspector:    http://127.0.0.1:{port}/events
+  🔄 State Reset:        http://127.0.0.1:{port}/reset
   ⚡ Webhook Trigger:    http://127.0.0.1:{port}/webhook/trigger
   ❤️ Health Check:       http://127.0.0.1:{port}/health
 
 Press Ctrl+C to stop.
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_mcp_daemon_url_precedence() {
+        assert_eq!(
+            resolve_mcp_daemon_url(
+                Some("http://127.0.0.1:9000".into()),
+                None,
+                false,
+                Some("http://127.0.0.1:9999".into())
+            ),
+            Some("http://127.0.0.1:9000".into())
+        );
+        assert_eq!(
+            resolve_mcp_daemon_url(None, Some(9123), false, Some("http://127.0.0.1:9999".into())),
+            Some("http://127.0.0.1:9123".into())
+        );
+        assert_eq!(
+            resolve_mcp_daemon_url(None, None, false, Some("http://127.0.0.1:9999".into())),
+            Some("http://127.0.0.1:9999".into())
+        );
+        assert_eq!(
+            resolve_mcp_daemon_url(None, None, false, Some("   ".into())),
+            Some("http://127.0.0.1:8787".into())
+        );
+        assert_eq!(
+            resolve_mcp_daemon_url(None, None, false, None),
+            Some("http://127.0.0.1:8787".into())
+        );
+        assert_eq!(
+            resolve_mcp_daemon_url(Some("http://127.0.0.1:9000".into()), None, true, None),
+            None
+        );
+    }
 }

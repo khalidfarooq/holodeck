@@ -96,14 +96,14 @@ flowchart LR
 
 ## 🤖 Model Context Protocol (MCP) Tools
 
-When Holodeck runs in MCP mode (`holodeck mcp`), AI coding agents can call these tools natively over stdio:
+When Holodeck runs in MCP mode (`holodeck mcp`), it connects over HTTP to the running `holodeck start` daemon (default `http://127.0.0.1:8787`, configurable via `--url`, `--port`, or `HOLODECK_URL`, or `--standalone` for isolated in-memory mode) so AI coding agents can call these tools natively over stdio:
 
 | MCP Tool | Description |
 | :--- | :--- |
-| `holodeck_trigger_webhook` | Dispatches an HMAC-SHA256 signed webhook payload to your local dev server (e.g. Stripe, GitHub). |
-| `holodeck_inspect_events` | Queries captured emails, SMS, charges, and webhooks to verify backend side-effects during agent test runs. |
+| `holodeck_trigger_webhook` | Dispatches an HMAC-SHA256 signed webhook payload via `POST /webhook/trigger` to your local dev server (e.g. Stripe, GitHub). |
+| `holodeck_inspect_events` | Queries captured emails, SMS, charges, and webhooks via `GET /events` to verify backend side-effects during agent test runs. |
 | `holodeck_get_mock_credentials` | Returns mock API keys, endpoints, and `.env.test` configuration snippets for any cloud provider. |
-| `holodeck_reset_state` | Clears captured event logs and in-memory mock databases between test runs. |
+| `holodeck_reset_state` | Clears captured event logs and all stateful provider stores via `POST /reset` (supports optional `provider` filter). |
 
 ### Connecting to Claude Code / Antigravity / Cursor
 
@@ -114,7 +114,7 @@ Add to your `claude_desktop_config.json` or `.gemini/antigravity/mcp.json` or `.
   "mcpServers": {
     "holodeck": {
       "command": "holodeck",
-      "args": ["mcp"]
+      "args": ["mcp", "--url", "http://127.0.0.1:8787"]
     }
   }
 }
@@ -130,19 +130,22 @@ Holodeck ships as a single, high-performance binary:
 # 1. Start the HTTP mock-cloud daemon
 holodeck start --port 8787
 
-# 2. Start MCP server over stdio for Claude Code / Antigravity
-holodeck mcp
+# 2. Start MCP server over stdio connected to the running daemon (or pass --standalone)
+holodeck mcp --port 8787
 
-# 3. Dispatch an HMAC signed webhook directly to your local endpoint
+# 3. Reset all simulator stores and event logs (or scope with ?provider=stripe)
+curl -X POST http://127.0.0.1:8787/reset
+
+# 4. Dispatch an HMAC signed webhook directly to your local endpoint
 holodeck trigger \
   --provider stripe \
   --target http://localhost:3000/api/webhooks/stripe \
   --event checkout.session.completed
 
-# 4. Check daemon status
+# 5. Check daemon status
 holodeck status --port 8787
 
-# 5. Output mock credentials to copy into .env.test
+# 6. Output mock credentials to copy into .env.test
 holodeck env --provider all
 ```
 
